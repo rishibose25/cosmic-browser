@@ -1,5 +1,15 @@
-[package]\nname = "cosmic-browser"\nversion = "0.1.0"\nedition = "2018"\n\n[dependencies]\nlibcosmic = "*"\ntokio = { version = "*", features = ["full"] }\nwgpu = "*"\ncosmic-text = "*"\ntracing = "*"\nserde = "*"\ni18n-embed = "*"\nreqwest = "*"\n\n[profile.dev]\nopt-level = 0\n\n[profile.release]\nopt-level = 3\n
+[package]
+name = "cosmic-browser"
+version = "0.1.0"
+edition = "2021"
 
 [dependencies]
+libcosmic = { version = "*", features = ["wayland", "tokio"] }
+tokio = { version = "*", features = ["full"] }
 wry = "0.43"
 tao = "0.30"
+cosmic-text = "*"
+tracing = "*"
+serde = { version = "*", features = ["derive"] }
+i18n-embed = "*"
+reqwest = { version = "*", features = ["rustls-tls"] }
