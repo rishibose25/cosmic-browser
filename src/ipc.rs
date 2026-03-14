@@ -1,19 +1,21 @@
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-/// Events the WebView sends back to the iced shell.
 #[derive(Debug, Clone)]
 pub enum WebViewEvent {
-    TitleChanged(String),
-    UrlChanged(String),
-    FaviconUrl(String),
-    LoadStarted,
-    LoadFinished,
-    LoadProgress(f64), // 0.0 – 1.0
+    TitleChanged        { tab_id: usize, title: String },
+    UrlChanged          { tab_id: usize, url: String },
+    LoadStarted         { tab_id: usize },
+    LoadFinished        { tab_id: usize },
+    LoadProgress        { tab_id: usize, progress: f64 },
+    IpcMessage          { tab_id: usize, body: String },
+    NewWindowRequested  { tab_id: usize, url: String },
+    DownloadStarted     { tab_id: usize, url: String, suggested_path: Option<String> },
+    PermissionRequested { tab_id: usize, permission: String },
+    NavigationBlocked   { tab_id: usize, url: String },
 }
 
-/// A cloneable sender the WebView callbacks hold.
-pub type EventSender = mpsc::UnboundedSender<WebViewEvent>;
-/// The receiver the iced subscription drains.
+pub type EventSender   = mpsc::UnboundedSender<WebViewEvent>;
 pub type EventReceiver = mpsc::UnboundedReceiver<WebViewEvent>;
 
 pub fn channel() -> (EventSender, EventReceiver) {
