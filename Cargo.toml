@@ -4,12 +4,24 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-libcosmic = { version = "*", features = ["wayland", "tokio"] }
-tokio = { version = "*", features = ["full"] }
-wry = "0.43"
-tao = "0.30"
-cosmic-text = "*"
-tracing = "*"
-serde = { version = "*", features = ["derive"] }
-i18n-embed = "*"
-reqwest = { version = "*", features = ["rustls-tls"] }
+libcosmic = { version = "0.1", features = ["wayland", "tokio"] }
+tokio = { version = "1", features = ["full"] }
+wry = { version = "0.43", default-features = false, features = ["linux-body-background-color"] }
+tao = { version = "0.30", default-features = false, features = ["rwh_06"] }
+raw-window-handle = "0.6"
+cosmic-text = "0.12"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = { version = "1", features = ["derive"] }
+reqwest = { version = "0.12", features = ["rustls-tls"] }
+ashpd = "0.9"           # XDG portals (downloads, permissions)
+url = "2"
+tokio-stream = "0.1"
+
+[dependencies.webkit2gtk]
+version = "2"
+features = ["v2_40"]
+
+[profile.release]
+opt-level = 3
+lto = true
