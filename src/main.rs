@@ -1,12 +1,14 @@
-// Cosmic DE application main file
+mod app;
+mod browser;
+mod ipc;
+mod sidebar;
+mod toolbar;
+mod webview_widget;
 
 fn main() {
-    // Initialize the cosmic browser
-    initialize_browser();
-}
+    tracing_subscriber::fmt()
+        .with_env_filter("cosmic_browser=debug")
+        .init();
 
-fn initialize_browser() {
-    // Here we would set up our cosmic browser environment
-    println!("Cosmic Browser initialized.");
-    // Additional setup code goes here
+    app::run();
 }
