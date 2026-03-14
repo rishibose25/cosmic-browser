@@ -1,67 +1,125 @@
-use std::collections::HashMap;
-use std::io::{self, Write};
+use cosmic::app::{Command, Core, Settings};
+use cosmic::iced::Length;
+use cosmic::widget::{self, nav_bar};
+use cosmic::{Application, ApplicationExt, Element, Theme};
 
-// Define a simple Application trait
-trait Application {
-    fn new() -> Self;
-    fn run(&mut self);
-    fn navigate(&mut self, url: &str);
-    fn open_tab(&mut self, title: &str, url: &str);
+use crate::sidebar::SidebarTab;
+use crate::toolbar::Toolbar;
+use crate::browser::BrowserEngine;
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    Navigate(String),
+    AddressChanged(String),
+    NewTab,
+    CloseTab(usize),
+    SelectTab(usize),
+    Back,
+    Forward,
+    Reload,
 }
 
-struct BrowserApp {
-    address_bar: String,
-    tabs: HashMap<String, String>, // A map of tab titles to URLs
+pub struct CosmicBrowser {
+    core: Core,
+    tabs: Vec<SidebarTab>,
+    active_tab: usize,
+    address_input: String,
+    engine: BrowserEngine,
 }
 
-impl Application for BrowserApp {
-    fn new() -> Self {
-        Self {
-            address_bar: String::new(),
-            tabs: HashMap::new(),
-        }
+impl Application for CosmicBrowser {
+    type Message = Message;
+    type Executor = cosmic::executor::Default;
+    type Flags = ();
+    const APP_ID: &'static str = "com.example.CosmicBrowser";
+
+    fn core(&self) -> &Core { &self.core }
+    fn core_mut(&mut self) -> &mut Core { &mut self.core }
+
+    fn init(core: Core, _flags: ()) -> (Self, Command<Message>) {
+        let initial_tab = SidebarTab::new("New Tab", "https://start.page");
+        (
+            Self {
+                core,
+                tabs: vec![initial_tab],
+                active_tab: 0,
+                address_input: String::from("https://start.page"),
+                engine: BrowserEngine::new(),
+            },
+            Command::none(),
+        )
     }
 
-    fn run(&mut self) {
-        println!("Welcome to Cosmic Browser!");
-        self.load_default_tab();
-        loop {
-            self.display_tabs();
-            print!("Address Bar: ");
-            io::stdout().flush().unwrap();
-            self.address_bar.clear();
-            io::stdin().read_line(&mut self.address_bar).unwrap();
-            let input = self.address_bar.trim();
-            if input == "exit" {
-                break;
-            } else {
-                self.navigate(input);
+    fn update(&mut self, message: Message) -> Command<Message> {
+        match message {
+            Message::Navigate(url) => {
+                self.address_input = url.clone();
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.url = url.clone();
+                }
+                self.engine.navigate(&url);
             }
+            Message::AddressChanged(input) => {
+                self.address_input = input;
+            }
+            Message::NewTab => {
+                self.tabs.push(SidebarTab::new("New Tab", "https://start.page"));
+                self.active_tab = self.tabs.len() - 1;
+            }
+            Message::CloseTab(idx) => {
+                if self.tabs.len() > 1 {
+                    self.tabs.remove(idx);
+                    self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+                }
+            }
+            Message::SelectTab(idx) => {
+                self.active_tab = idx;
+                if let Some(tab) = self.tabs.get(idx) {
+                    self.address_input = tab.url.clone();
+                    self.engine.navigate(&tab.url);
+                }
+            }
+            Message::Back => self.engine.back(),
+            Message::Forward => self.engine.forward(),
+            Message::Reload => self.engine.reload(),
         }
+        Command::none()
     }
 
-    fn navigate(&mut self, url: &str) {
-        println!("Navigating to: {}","url");
-    }
+    fn view(&self) -> Element<Message> {
+        // Left vertical tab sidebar (Zen-style)
+        let sidebar = crate::sidebar::view(&self.tabs, self.active_tab);
 
-    fn open_tab(&mut self, title: &str, url: &str) {
-        self.tabs.insert(String::from(title), String::from(url));
-        println!("Opened a new tab: {} - {}", title, url);
-    }
+        // Top toolbar with back/forward/reload + address bar
+        let toolbar = crate::toolbar::view(&self.address_input);
 
-    fn load_default_tab(&mut self) {
-        self.open_tab("Home", "http://example.com");
-    }
+        // Content area: WebView is rendered here by wry separately;
+        // we render a placeholder that reserves the space
+        let content = widget::container(
+            widget::text("WebView renders here")
+                .size(14)
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(cosmic::theme::Container::Background);
 
-    fn display_tabs(&self) {
-        println!("Open Tabs:");
-        for (title, url) in &self.tabs {
-            println!("{}: {}", title, url);
-        }
+        // Main layout: sidebar | (toolbar / content)
+        let right_pane = widget::column::with_children(vec![
+            toolbar,
+            content.into(),
+        ]);
+
+        widget::row::with_children(vec![
+            sidebar,
+            right_pane.into(),
+        ])
+        .into()
     }
 }
 
-fn main() {
-    let mut app = BrowserApp::new();
-    app.run();
+pub fn run() {
+    let settings = Settings::default()
+        .size((1280, 800))
+        .resizable(true);
+    cosmic::app::run::<CosmicBrowser>(settings, ()).unwrap();
 }
