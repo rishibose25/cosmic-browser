@@ -1,10 +1,8 @@
-use std::sync::{Arc, Mutex};
 use wry::{WebView, WebViewBuilder, PageLoadEvent};
 use raw_window_handle::RawWindowHandle;
-use webkit2gtk::{WebViewExt, LoadEvent};
+use webkit2gtk::WebViewExt;
 use glib::prelude::*;
 use url::Url;
-use urlencoding;
 
 use crate::ipc::{EventSender, WebViewEvent};
 
@@ -31,13 +29,13 @@ impl TabWebView {
         tab_id: usize,
         visible: bool,
     ) -> Result<Self, wry::Error> {
-        let tx_title    = sender.clone();
-        let tx_nav      = sender.clone();
-        let tx_load     = sender.clone();
-        let tx_ipc      = sender.clone();
-        let tx_newwin   = sender.clone();
-        let tx_dl       = sender.clone();
-        let tx_perm     = sender.clone();
+        let tx_title  = sender.clone();
+        let tx_nav    = sender.clone();
+        let tx_load   = sender.clone();
+        let tx_ipc    = sender.clone();
+        let tx_newwin = sender.clone();
+        let tx_dl     = sender.clone();
+        let tx_perm   = sender.clone();
 
         #[cfg(debug_assertions)]
         let devtools = true;
@@ -68,10 +66,7 @@ impl TabWebView {
             .with_navigation_handler(move |url| {
                 if !is_allowed_scheme(&url) {
                     tracing::warn!("Blocked navigation to: {url}");
-                    let _ = tx_nav.send(WebViewEvent::NavigationBlocked {
-                        tab_id,
-                        url,
-                    });
+                    let _ = tx_nav.send(WebViewEvent::NavigationBlocked { tab_id, url });
                     return false;
                 }
                 let _ = tx_nav.send(WebViewEvent::UrlChanged { tab_id, url });
@@ -117,49 +112,48 @@ impl TabWebView {
             .with_visible(visible)
             .build_as_child_of(window_handle)?;
 
-        // ── Wire webkit2gtk signals not exposed by wry ────────────────────
-        //
-        // wry gives us the underlying webkit2gtk WebView via webview.inner().
-        // We connect GObject property-notify signals directly on it so we get
-        // granular load progress and accurate back/forward state.
+        // ── webkit2gtk signals ────────────────────────────────────────────
         {
             let gtk_wv = webview.inner();
 
-            // notify::estimated-load-progress — fires continuously 0.0 → 1.0
+            // estimated-load-progress
             let tx_progress = sender.clone();
             gtk_wv.connect_notify(Some("estimated-load-progress"), move |wv, _| {
-                let progress = wv.estimated_load_progress();
                 let _ = tx_progress.send(WebViewEvent::LoadProgress {
                     tab_id,
-                    progress,
+                    progress: wv.estimated_load_progress(),
                 });
             });
 
-            // notify::can-go-back
-            let tx_back = sender.clone();
-            gtk_wv.connect_notify(Some("can-go-back"), move |wv, _| {
-                let _ = tx_back.send(WebViewEvent::CanGoBackChanged {
-                    tab_id,
-                    can_go: wv.can_go_back(),
-                });
+            // can-go-back and can-go-forward — both read both values
+            let tx_back_fwd = sender.clone();
+            gtk_wv.connect_notify(Some("can-go-back"), {
+                let tx  = tx_back_fwd.clone();
+                let wvr = gtk_wv.clone();
+                move |_, _| {
+                    let _ = tx.send(WebViewEvent::CanGoChanged {
+                        tab_id,
+                        back:    wvr.can_go_back(),
+                        forward: wvr.can_go_forward(),
+                    });
+                }
+            });
+            gtk_wv.connect_notify(Some("can-go-forward"), {
+                let tx  = tx_back_fwd.clone();
+                let wvr = gtk_wv.clone();
+                move |_, _| {
+                    let _ = tx.send(WebViewEvent::CanGoChanged {
+                        tab_id,
+                        back:    wvr.can_go_back(),
+                        forward: wvr.can_go_forward(),
+                    });
+                }
             });
 
-            // notify::can-go-forward
-            let tx_fwd = sender.clone();
-            gtk_wv.connect_notify(Some("can-go-forward"), move |wv, _| {
-                let _ = tx_fwd.send(WebViewEvent::CanGoForwardChanged {
-                    tab_id,
-                    can_go: wv.can_go_forward(),
-                });
-            });
-
-            // notify::favicon — webkit2gtk surfaces a cairo surface;
-            // we derive a data: URI from the page URL for now and let
-            // reqwest fetch it in the shell layer.
+            // uri — derive favicon URL from page origin
             let tx_favicon = sender.clone();
             gtk_wv.connect_notify(Some("uri"), move |wv, _| {
                 if let Some(uri) = wv.uri() {
-                    // Derive the favicon URL from the page origin
                     if let Ok(parsed) = Url::parse(uri.as_str()) {
                         let favicon = format!(
                             "{}://{}/favicon.ico",
@@ -346,8 +340,6 @@ impl BrowserEngine {
         }
     }
 
-    // ── Active tab convenience methods ────────────────────────────────────
-
     pub fn navigate(&mut self, url: &str) {
         let url = normalize_url(url);
         if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -401,17 +393,10 @@ impl BrowserEngine {
         self.tabs.len()
     }
 
-    /// Called from app.rs when a WebViewEvent::CanGoBackChanged arrives
-    pub fn update_can_go_back(&mut self, tab_id: usize, can_go: bool) {
+    pub fn update_can_go(&mut self, tab_id: usize, back: bool, forward: bool) {
         if let Some(tab) = self.tabs.get_mut(tab_id) {
-            tab.can_go_back = can_go;
-        }
-    }
-
-    /// Called from app.rs when a WebViewEvent::CanGoForwardChanged arrives
-    pub fn update_can_go_forward(&mut self, tab_id: usize, can_go: bool) {
-        if let Some(tab) = self.tabs.get_mut(tab_id) {
-            tab.can_go_forward = can_go;
+            tab.can_go_back    = back;
+            tab.can_go_forward = forward;
         }
     }
 }
