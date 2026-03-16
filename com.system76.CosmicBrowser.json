@@ -1,0 +1,39 @@
+{
+    "app-id": "com.system76.CosmicBrowser",
+    "runtime": "org.gnome.Platform",
+    "runtime-version": "46",
+    "sdk": "org.gnome.Sdk",
+    "sdk-extensions": ["org.freedesktop.Sdk.Extension.rust-stable"],
+    "command": "cosmic-browser",
+    "finish-args": [
+        "--share=network",
+        "--share=ipc",
+        "--socket=wayland",
+        "--socket=fallback-x11",
+        "--device=dri",
+        "--filesystem=xdg-download",
+        "--talk-name=org.freedesktop.portal.Desktop"
+    ],
+    "build-options": {
+        "append-path": "/usr/lib/sdk/rust-stable/bin",
+        "env": {
+            "CARGO_HOME": "/run/build/cosmic-browser/cargo"
+        }
+    },
+    "modules": [
+        {
+            "name": "cosmic-browser",
+            "buildsystem": "simple",
+            "build-commands": [
+                "cargo build --release",
+                "install -Dm755 target/release/cosmic-browser /app/bin/cosmic-browser"
+            ],
+            "sources": [
+                {
+                    "type": "dir",
+                    "path": "."
+                }
+            ]
+        }
+    ]
+}
