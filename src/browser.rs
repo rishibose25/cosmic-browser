@@ -1,10 +1,14 @@
 use std::sync::{Arc, Mutex};
 use wry::{WebView, WebViewBuilder, PageLoadEvent};
 use raw_window_handle::RawWindowHandle;
-use crate::ipc::{EventSender, WebViewEvent};
+use webkit2gtk::{WebViewExt, LoadEvent};
+use glib::prelude::*;
 use url::Url;
+use urlencoding;
 
-// ── Per-tab WebView instance ─────────────────────────────────────────────────
+use crate::ipc::{EventSender, WebViewEvent};
+
+// ── Per-tab WebView ───────────────────────────────────────────────────────────
 
 pub struct TabWebView {
     pub webview: WebView,
@@ -30,10 +34,10 @@ impl TabWebView {
         let tx_title    = sender.clone();
         let tx_nav      = sender.clone();
         let tx_load     = sender.clone();
-        let tx_progress = sender.clone();
-        let tx_favicon  = sender.clone();
+        let tx_ipc      = sender.clone();
+        let tx_newwin   = sender.clone();
         let tx_dl       = sender.clone();
-        let tx_err      = sender.clone();
+        let tx_perm     = sender.clone();
 
         #[cfg(debug_assertions)]
         let devtools = true;
@@ -42,112 +46,134 @@ impl TabWebView {
 
         let webview = WebViewBuilder::new()
             .with_url(initial_url)
-
-            // ── Identity ──────────────────────────────────────────────────
             .with_user_agent(
                 "Mozilla/5.0 (X11; Linux x86_64) \
                  AppleWebKit/605.1.15 (KHTML, like Gecko) \
                  CosmicBrowser/0.1 Safari/605.1.15"
             )
-
-            // ── Capabilities ──────────────────────────────────────────────
             .with_devtools(devtools)
             .with_clipboard(true)
             .with_accept_first_mouse(true)
-
-            // ── Initialization script ─────────────────────────────────────
-            // Expose a JS→Rust IPC channel for extensions and future features
-            .with_initialization_script(r#"
-                window.__cosmicBrowser = {
-                    ipc: (msg) => window.ipc.postMessage(JSON.stringify(msg)),
-                    tabId: TAB_ID_PLACEHOLDER,
-                };
-            "#.replace("TAB_ID_PLACEHOLDER", &tab_id.to_string()))
-
-            // ── Title changes ─────────────────────────────────────────────
+            .with_initialization_script(
+                &format!(r#"
+                    window.__cosmicBrowser = {{
+                        ipc: (msg) => window.ipc.postMessage(JSON.stringify(msg)),
+                        tabId: {tab_id},
+                    }};
+                "#)
+            )
             .with_title_changed_handler(move |title| {
-                let _ = tx_title.send(WebViewEvent::TitleChanged {
-                    tab_id,
-                    title,
-                });
+                let _ = tx_title.send(WebViewEvent::TitleChanged { tab_id, title });
             })
-
-            // ── Navigation (URL bar sync + back/forward state) ────────────
             .with_navigation_handler(move |url| {
-                // Block non-http(s)/about/file schemes
                 if !is_allowed_scheme(&url) {
                     tracing::warn!("Blocked navigation to: {url}");
+                    let _ = tx_nav.send(WebViewEvent::NavigationBlocked {
+                        tab_id,
+                        url,
+                    });
                     return false;
                 }
-                let _ = tx_nav.send(WebViewEvent::UrlChanged {
-                    tab_id,
-                    url,
-                });
+                let _ = tx_nav.send(WebViewEvent::UrlChanged { tab_id, url });
                 true
             })
-
-            // ── Page load (started / finished + webkit progress signal) ───
-            .with_on_page_load_handler(move |event, url| {
+            .with_on_page_load_handler(move |event, _url| {
                 match event {
-                    PageLoadEvent::Started => {
-                        let _ = tx_load.send(WebViewEvent::LoadStarted { tab_id });
-                    }
-                    PageLoadEvent::Finished => {
-                        let _ = tx_load.send(WebViewEvent::LoadFinished { tab_id });
-                    }
+                    PageLoadEvent::Started  =>
+                        { let _ = tx_load.send(WebViewEvent::LoadStarted  { tab_id }); }
+                    PageLoadEvent::Finished =>
+                        { let _ = tx_load.send(WebViewEvent::LoadFinished { tab_id }); }
                 }
             })
-
-            // ── IPC handler (JS → Rust) ────────────────────────────────────
             .with_ipc_handler(move |request| {
-                let body = request.body().to_string();
-                tracing::debug!("IPC from tab {tab_id}: {body}");
-                let _ = tx_progress.send(WebViewEvent::IpcMessage {
+                let _ = tx_ipc.send(WebViewEvent::IpcMessage {
                     tab_id,
-                    body,
+                    body: request.body().to_string(),
                 });
             })
-
-            // ── window.open() and target=_blank ───────────────────────────
             .with_new_window_requested_handler(move |url, _frame| {
-                let _ = tx_favicon.send(WebViewEvent::NewWindowRequested {
-                    tab_id,
-                    url,
-                });
-                // Return false = we handle it ourselves (open as new tab)
+                let _ = tx_newwin.send(WebViewEvent::NewWindowRequested { tab_id, url });
                 false
             })
-
-            // ── Downloads ─────────────────────────────────────────────────
-            .with_download_started_handler(move |url, suggested_path| {
+            .with_download_started_handler(move |url, path| {
                 let _ = tx_dl.send(WebViewEvent::DownloadStarted {
                     tab_id,
                     url,
-                    suggested_path: suggested_path
-                        .map(|p| p.to_string_lossy().to_string()),
+                    suggested_path: path.map(|p| p.to_string_lossy().to_string()),
                 });
-                // Return false = cancel internal download, we handle via portal
                 false
             })
-
-            // ── Permission requests (camera, mic, geolocation) ────────────
             .with_permission_handler(move |request| {
-                let _ = tx_err.send(WebViewEvent::PermissionRequested {
+                let _ = tx_perm.send(WebViewEvent::PermissionRequested {
                     tab_id,
                     permission: format!("{:?}", request.permission()),
                 });
-                // Deny by default; the shell will re-evaluate after prompting the user
                 false
             })
-
-            // ── Positioning (hole-punch into iced window) ─────────────────
             .with_bounds(wry::Rect {
                 position: wry::dpi::LogicalPosition::new(x, y),
-                size: wry::dpi::LogicalSize::new(width, height),
+                size:     wry::dpi::LogicalSize::new(width, height),
             })
             .with_visible(visible)
-
             .build_as_child_of(window_handle)?;
+
+        // ── Wire webkit2gtk signals not exposed by wry ────────────────────
+        //
+        // wry gives us the underlying webkit2gtk WebView via webview.inner().
+        // We connect GObject property-notify signals directly on it so we get
+        // granular load progress and accurate back/forward state.
+        {
+            let gtk_wv = webview.inner();
+
+            // notify::estimated-load-progress — fires continuously 0.0 → 1.0
+            let tx_progress = sender.clone();
+            gtk_wv.connect_notify(Some("estimated-load-progress"), move |wv, _| {
+                let progress = wv.estimated_load_progress();
+                let _ = tx_progress.send(WebViewEvent::LoadProgress {
+                    tab_id,
+                    progress,
+                });
+            });
+
+            // notify::can-go-back
+            let tx_back = sender.clone();
+            gtk_wv.connect_notify(Some("can-go-back"), move |wv, _| {
+                let _ = tx_back.send(WebViewEvent::CanGoBackChanged {
+                    tab_id,
+                    can_go: wv.can_go_back(),
+                });
+            });
+
+            // notify::can-go-forward
+            let tx_fwd = sender.clone();
+            gtk_wv.connect_notify(Some("can-go-forward"), move |wv, _| {
+                let _ = tx_fwd.send(WebViewEvent::CanGoForwardChanged {
+                    tab_id,
+                    can_go: wv.can_go_forward(),
+                });
+            });
+
+            // notify::favicon — webkit2gtk surfaces a cairo surface;
+            // we derive a data: URI from the page URL for now and let
+            // reqwest fetch it in the shell layer.
+            let tx_favicon = sender.clone();
+            gtk_wv.connect_notify(Some("uri"), move |wv, _| {
+                if let Some(uri) = wv.uri() {
+                    // Derive the favicon URL from the page origin
+                    if let Ok(parsed) = Url::parse(uri.as_str()) {
+                        let favicon = format!(
+                            "{}://{}/favicon.ico",
+                            parsed.scheme(),
+                            parsed.host_str().unwrap_or("")
+                        );
+                        let _ = tx_favicon.send(WebViewEvent::FaviconUrl {
+                            tab_id,
+                            url: favicon,
+                        });
+                    }
+                }
+            });
+        }
 
         Ok(Self {
             webview,
@@ -164,7 +190,7 @@ impl TabWebView {
     pub fn set_bounds(&self, x: i32, y: i32, width: u32, height: u32) {
         let _ = self.webview.set_bounds(wry::Rect {
             position: wry::dpi::LogicalPosition::new(x, y),
-            size: wry::dpi::LogicalSize::new(width, height),
+            size:     wry::dpi::LogicalSize::new(width, height),
         });
     }
 
@@ -207,7 +233,6 @@ impl TabWebView {
         let _ = self.webview.set_zoom_level(1.0);
     }
 
-    /// Send a message from Rust → JS (for extension support later)
     pub fn post_message(&self, json: &str) {
         let script = format!(
             "window.dispatchEvent(new MessageEvent('cosmicBrowser', \
@@ -218,19 +243,16 @@ impl TabWebView {
     }
 }
 
-// ── Multi-tab engine ─────────────────────────────────────────────────────────
+// ── Multi-tab engine ──────────────────────────────────────────────────────────
 
 pub struct BrowserEngine {
     tabs: Vec<TabWebView>,
     active: usize,
     sender: EventSender,
-    /// Cached window handle and content bounds, set on first attach
     window_handle: Option<RawWindowHandle>,
     bounds: (i32, i32, u32, u32),
 }
 
-// SAFETY: RawWindowHandle is not Send by default, but we only access it
-// from the main thread during attach/tab creation.
 unsafe impl Send for BrowserEngine {}
 
 impl BrowserEngine {
@@ -244,7 +266,6 @@ impl BrowserEngine {
         }
     }
 
-    /// Called once the iced window is realized.
     pub fn attach(
         &mut self,
         handle: RawWindowHandle,
@@ -253,8 +274,6 @@ impl BrowserEngine {
     ) {
         self.window_handle = Some(handle);
         self.bounds = (x, y, width, height);
-
-        // Create the first tab
         self.open_tab("https://start.page", true);
     }
 
@@ -262,7 +281,6 @@ impl BrowserEngine {
         self.window_handle.is_some()
     }
 
-    /// Open a new tab, optionally making it active immediately.
     pub fn open_tab(&mut self, url: &str, activate: bool) -> usize {
         let handle = match self.window_handle {
             Some(h) => h,
@@ -276,7 +294,6 @@ impl BrowserEngine {
         let tab_id = self.tabs.len();
         let (x, y, w, h) = self.bounds;
 
-        // Hide all existing tabs if we're activating this one
         if activate {
             for tab in &self.tabs {
                 tab.set_visible(false);
@@ -292,13 +309,11 @@ impl BrowserEngine {
         ) {
             Ok(tab) => {
                 self.tabs.push(tab);
-                if activate {
-                    self.active = tab_id;
-                }
+                if activate { self.active = tab_id; }
                 tab_id
             }
             Err(e) => {
-                tracing::error!("Failed to create tab WebView: {e}");
+                tracing::error!("Failed to create WebView: {e}");
                 0
             }
         }
@@ -315,21 +330,15 @@ impl BrowserEngine {
 
     pub fn select_tab(&mut self, idx: usize) {
         if idx >= self.tabs.len() { return; }
-
-        // Hide current
         if let Some(prev) = self.tabs.get(self.active) {
             prev.set_visible(false);
         }
-
         self.active = idx;
-
-        // Show new
         if let Some(tab) = self.tabs.get(idx) {
             tab.set_visible(true);
         }
     }
 
-    /// Reposition all WebViews when the content area changes.
     pub fn set_bounds(&mut self, x: i32, y: i32, width: u32, height: u32) {
         self.bounds = (x, y, width, height);
         for tab in &self.tabs {
@@ -337,7 +346,7 @@ impl BrowserEngine {
         }
     }
 
-    // ── Active tab convenience methods ───────────────────────────────────────
+    // ── Active tab convenience methods ────────────────────────────────────
 
     pub fn navigate(&mut self, url: &str) {
         let url = normalize_url(url);
@@ -384,10 +393,6 @@ impl BrowserEngine {
         self.tabs.get_mut(self.active)
     }
 
-    pub fn tab(&self, idx: usize) -> Option<&TabWebView> {
-        self.tabs.get(idx)
-    }
-
     pub fn tab_mut(&mut self, idx: usize) -> Option<&mut TabWebView> {
         self.tabs.get_mut(idx)
     }
@@ -395,12 +400,25 @@ impl BrowserEngine {
     pub fn tab_count(&self) -> usize {
         self.tabs.len()
     }
+
+    /// Called from app.rs when a WebViewEvent::CanGoBackChanged arrives
+    pub fn update_can_go_back(&mut self, tab_id: usize, can_go: bool) {
+        if let Some(tab) = self.tabs.get_mut(tab_id) {
+            tab.can_go_back = can_go;
+        }
+    }
+
+    /// Called from app.rs when a WebViewEvent::CanGoForwardChanged arrives
+    pub fn update_can_go_forward(&mut self, tab_id: usize, can_go: bool) {
+        if let Some(tab) = self.tabs.get_mut(tab_id) {
+            tab.can_go_forward = can_go;
+        }
+    }
 }
 
 // ── URL normalisation ─────────────────────────────────────────────────────────
 
 fn normalize_url(input: &str) -> String {
-    // Pass-through for special schemes
     if matches!(
         input.split(':').next().unwrap_or(""),
         "about" | "file" | "data" | "view-source" | "blob"
@@ -408,14 +426,12 @@ fn normalize_url(input: &str) -> String {
         return input.to_string();
     }
 
-    // Already a valid URL with a scheme
     if let Ok(u) = Url::parse(input) {
         if u.scheme() == "http" || u.scheme() == "https" {
             return input.to_string();
         }
     }
 
-    // localhost and 127.x.x.x / [::1] → http (not https)
     if input.starts_with("localhost")
         || input.starts_with("127.")
         || input.starts_with("[::1]")
@@ -423,7 +439,6 @@ fn normalize_url(input: &str) -> String {
         return format!("http://{input}");
     }
 
-    // Looks like a hostname (has a dot, no spaces, no special chars)
     let looks_like_host = input.contains('.')
         && !input.contains(' ')
         && !input.contains('?')
@@ -433,7 +448,6 @@ fn normalize_url(input: &str) -> String {
         return format!("https://{input}");
     }
 
-    // Everything else is a search query
     format!(
         "https://search.brave.com/search?q={}",
         urlencoding::encode(input)
