@@ -14,6 +14,8 @@ use raw_window_handle::HasWindowHandle;
 
 use crate::browser::BrowserEngine;
 use crate::ipc::{self, WebViewEvent};
+use crate::settings::BrowserSettings;
+use crate::settings_ui::SettingsMessage;
 use crate::sidebar::SidebarTab;
 use crate::webview_widget::{BoundsState, WebViewPlaceholder};
 
@@ -29,6 +31,9 @@ pub enum Message {
     NewTab,
     CloseTab(usize),
     SelectTab(usize),
+    OpenSettings,
+    CloseSettings,
+    SettingsAction(SettingsMessage),
     WebViewEvent(WebViewEvent),
     ContentBoundsChanged(Rectangle<f32>),
     WindowReady(window::Id),
@@ -48,6 +53,8 @@ pub struct CosmicBrowser {
     engine: Arc<Mutex<BrowserEngine>>,
     ipc_rx: Arc<Mutex<Option<ipc::EventReceiver>>>,
     webview_attached: bool,
+    settings: BrowserSettings,
+    show_settings: bool,
 }
 
 // ── Application ───────────────────────────────────────────────────────────────
@@ -63,12 +70,13 @@ impl Application for CosmicBrowser {
 
     fn init(core: Core, _flags: ()) -> (Self, Command<Message>) {
         let (tx, rx) = ipc::channel();
+        let settings = BrowserSettings::load();
 
         let app = Self {
             core,
-            tabs: vec![SidebarTab::new("New Tab", "https://start.page")],
+            tabs: vec![SidebarTab::new("New Tab", &settings.general.homepage)],
             active_tab: 0,
-            address_input: "https://start.page".into(),
+            address_input: settings.general.homepage.clone(),
             is_loading: false,
             load_progress: 0.0,
             content_bounds: Arc::new(Mutex::new(None)),
@@ -76,6 +84,8 @@ impl Application for CosmicBrowser {
             engine: Arc::new(Mutex::new(BrowserEngine::new(tx))),
             ipc_rx: Arc::new(Mutex::new(Some(rx))),
             webview_attached: false,
+            settings,
+            show_settings: false,
         };
 
         (app, Command::none())
@@ -132,7 +142,9 @@ impl Application for CosmicBrowser {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.url = url.clone();
                 }
-                if let Ok(mut e) = self.engine.lock() { e.navigate(&url); }
+                if let Ok(mut e) = self.engine.lock() {
+                    e.navigate(&url, &self.settings.search);
+                }
             }
 
             Message::AddressChanged(s) => {
@@ -144,11 +156,12 @@ impl Application for CosmicBrowser {
             Message::Reload  => { if let Ok(e)     = self.engine.lock() { e.reload(); } }
 
             Message::NewTab => {
-                self.tabs.push(SidebarTab::new("New Tab", "about:blank"));
+                let url = self.settings.general.new_tab_url.clone();
+                self.tabs.push(SidebarTab::new("New Tab", &url));
                 self.active_tab = self.tabs.len() - 1;
-                self.address_input = "about:blank".into();
+                self.address_input = url.clone();
                 if let Ok(mut e) = self.engine.lock() {
-                    e.open_tab("about:blank", true);
+                    e.open_tab(&url, true);
                 }
             }
 
@@ -165,6 +178,41 @@ impl Application for CosmicBrowser {
                 self.active_tab = i;
                 if let Some(tab) = self.tabs.get(i) {
                     self.address_input = tab.url.clone();
+                }
+            }
+
+            Message::OpenSettings => {
+                self.show_settings = true;
+            }
+
+            Message::CloseSettings => {
+                self.show_settings = false;
+            }
+
+            Message::SettingsAction(msg) => {
+                match msg {
+                    SettingsMessage::HomepageChanged(v)         => self.settings.general.homepage = v,
+                    SettingsMessage::NewTabUrlChanged(v)        => self.settings.general.new_tab_url = v,
+                    SettingsMessage::RestoreSessionToggled(v)   => self.settings.general.restore_session = v,
+                    SettingsMessage::JavascriptToggled(v)       => self.settings.privacy.javascript_enabled = v,
+                    SettingsMessage::CookiesToggled(v)          => self.settings.privacy.cookies_enabled = v,
+                    SettingsMessage::BlockThirdPartyToggled(v)  => self.settings.privacy.block_third_party_cookies = v,
+                    SettingsMessage::DoNotTrackToggled(v)       => self.settings.privacy.do_not_track = v,
+                    SettingsMessage::ClearOnCloseToggled(v)     => self.settings.privacy.clear_on_close = v,
+                    SettingsMessage::ThemeSelected(v)           => self.settings.appearance.theme = v,
+                    SettingsMessage::SidebarPositionSelected(v) => self.settings.appearance.sidebar_position = v,
+                    SettingsMessage::StatusBarToggled(v)        => self.settings.appearance.show_status_bar = v,
+                    SettingsMessage::SearchEngineSelected(v)    => self.settings.search.engine = v,
+                    SettingsMessage::CustomSearchUrlChanged(v)  => self.settings.search.custom_url = Some(v),
+                    SettingsMessage::SuggestToggled(v)          => self.settings.search.suggest = v,
+                    SettingsMessage::Save => {
+                        self.settings.save();
+                        self.show_settings = false;
+                    }
+                    SettingsMessage::Close => {
+                        self.settings = BrowserSettings::load();
+                        self.show_settings = false;
+                    }
                 }
             }
 
@@ -210,7 +258,13 @@ impl Application for CosmicBrowser {
                     }
                 }
                 WebViewEvent::NewWindowRequested { url, .. } => {
-                    return self.update(Message::NewTab);
+                    let url = url.clone();
+                    self.tabs.push(SidebarTab::new("New Tab", &url));
+                    self.active_tab = self.tabs.len() - 1;
+                    self.address_input = url.clone();
+                    if let Ok(mut e) = self.engine.lock() {
+                        e.open_tab(&url, true);
+                    }
                 }
                 WebViewEvent::DownloadStarted { url, suggested_path, .. } => {
                     tracing::info!("Download: {url} → {suggested_path:?}");
@@ -258,6 +312,11 @@ impl Application for CosmicBrowser {
     // ── View ──────────────────────────────────────────────────────────────────
 
     fn view(&self) -> Element<Message> {
+        if self.show_settings {
+            return crate::settings_ui::view(&self.settings)
+                .map(Message::SettingsAction);
+        }
+
         let sidebar = crate::sidebar::view(&self.tabs, self.active_tab);
         let toolbar = crate::toolbar::view(
             &self.address_input,
@@ -270,25 +329,36 @@ impl Application for CosmicBrowser {
             Message::ContentBoundsChanged,
         );
 
-        let status = widget::container(
-            widget::text(if self.is_loading {
-                format!("Loading… {:.0}%", self.load_progress * 100.0)
-            } else {
-                self.engine.lock()
-                    .map(|e| e.current_url().to_string())
-                    .unwrap_or_default()
-            })
-            .size(12),
-        )
-        .padding([2, 12])
-        .width(Length::Fill);
+        let status = if self.settings.appearance.show_status_bar {
+            Some(
+                widget::container(
+                    widget::text(if self.is_loading {
+                        format!("Loading… {:.0}%", self.load_progress * 100.0)
+                    } else {
+                        self.engine.lock()
+                            .map(|e| e.current_url().to_string())
+                            .unwrap_or_default()
+                    })
+                    .size(12),
+                )
+                .padding([2, 12])
+                .width(Length::Fill)
+                .into(),
+            )
+        } else {
+            None
+        };
 
-        let right = widget::column::with_children(vec![
+        let mut right_col = widget::column::with_children(vec![
             toolbar,
             placeholder.into(),
-            status.into(),
-        ])
-        .height(Length::Fill);
+        ]);
+
+        if let Some(bar) = status {
+            right_col = right_col.push(bar);
+        }
+
+        let right = right_col.height(Length::Fill);
 
         widget::row::with_children(vec![
             sidebar,
